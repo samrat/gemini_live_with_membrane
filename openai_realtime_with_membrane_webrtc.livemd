@@ -1,0 +1,358 @@
+# Gemini Multimodal Live <> Membrane WebRTC
+
+```elixir
+File.cd(__DIR__)
+Logger.configure(level: :info)
+
+Mix.install([
+  {:membrane_core, "~> 1.1"},
+  {:membrane_webrtc_plugin, "~> 0.22.0"},
+  {:membrane_opus_plugin, "~> 0.20.4"},
+  {:membrane_raw_audio_parser_plugin, "~> 0.4.0"},
+  {:membrane_realtimer_plugin, "~> 0.10.0"},
+  {:kino_membrane, "~> 0.3.0"},
+  {:websockex, "~> 0.4.3"},
+  {:jason, "~> 1.4"},
+  {:ex_webrtc, github: "elixir-webrtc/ex_webrtc", override: true},
+  {:membrane_h26x_plugin, "~> 0.10.2"},
+  {:membrane_h264_ffmpeg_plugin, "~> 0.32.5"},
+  {:turbojpeg, github: "gBillal/elixir-turbojpeg", branch: "upgrade-deps"}
+])
+```
+
+## Introduction
+
+This demo shows how to use Membrane Framework to create a simple WebRTC based app that allows you to have a conversation with Google Gemini using the [Multimodal Live API](https://ai.google.dev/api/multimodal-live).
+
+## Playback Queue
+
+Instead of sending Gemini's audio responses directly to the WebRTC sink, we queue it up using a simple GenServer. This module enables us to clear the queue when the user interrupts Gemini, and we no longer want to play the rest of Gemini's current response.
+
+```elixir
+defmodule PlaybackQueue do
+  use GenServer
+
+  def start_link(_opts) do
+    GenServer.start_link(__MODULE__, %{response: <<>>}, name: __MODULE__)
+  end
+
+  def append_audio(chunk) do
+    GenServer.call(__MODULE__, {:append_audio, chunk})
+  end
+
+  def clear_cache() do
+    GenServer.call(__MODULE__, :clear_cache)
+  end
+
+  def get_response_chunk(size) do
+    GenServer.call(__MODULE__, {:get_response_chunk, size})
+  end 
+
+  @impl true
+  def init(state) do
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_call(:clear_cache, _from, state) do
+    new_state = %{state | response: <<>>}
+    {:reply, :ok, new_state}
+  end
+
+  @impl true
+  def handle_call({:append_audio, chunk}, _from, state) do
+    new_state = %{state | response: state.response <> chunk}
+    {:reply, :ok, new_state}
+  end
+
+  @impl true
+  def handle_call({:get_response_chunk, size}, _from, state) do
+    case state.response do
+      <<chunk::binary-size(size), rest::binary>> ->
+        # If we have enough data, send it back
+        {:reply, {:ok, chunk}, %{state | response: rest}}
+
+      chunk ->
+        # Otherwise, send what we have, padded with silence
+        silence = <<0::size(size - byte_size(chunk))-unit(8)>>
+        {:reply, {:ok, chunk <> silence}, %{state | response: <<>>}}
+    end
+  end 
+end
+```
+
+The Gemini Multimodal Live API requires sending and receiving audio via the WebSocket. Let's create a module responsible for handling it with `WebSockex` library.
+
+```elixir
+defmodule GeminiWebSocket do
+  use WebSockex
+  require Logger
+
+  def start_link(opts) do
+    api_key = System.get_env("LB_GEMINI_API_KEY")
+    {:ok, _} = WebSockex.start_link(
+      "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=#{api_key}",
+      __MODULE__,
+      %{parent: self()},
+      opts
+    )
+  end
+
+  @impl true
+  def handle_connect(_conn, state) do
+    setup_msg = Jason.encode!(%{
+      setup: %{
+        model: "models/gemini-2.0-flash-exp"
+      }
+    })
+    WebSockex.cast(self(), {:send_message, {:text, setup_msg}})
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_cast({:send_message, frame}, state) do
+    {:reply, frame, state}
+  end
+
+  @impl true
+  def handle_frame(frame, state) do
+    send(state.parent, {:websocket_frame, frame})
+    {:ok, state}
+  end
+
+  def send_frame(ws, frame), do: WebSockex.send_frame(ws, {:text, frame})
+end
+```
+
+```elixir
+defmodule GeminiEndpoint do
+  use Membrane.Filter
+  require Membrane.Logger
+
+  def_input_pad(:audio, accepted_format: _any)
+  def_input_pad(:video, accepted_format: _any)
+
+  def_output_pad(:output, accepted_format: _any)
+
+  def_options(websocket_opts: [], playback_queue_pid: [])
+
+  @impl true
+  def handle_init(_ctx, opts) do
+    {:ok, ws} = GeminiWebSocket.start_link(opts.websocket_opts)
+    {[], %{ws: ws, playback_queue_pid: opts.playback_queue_pid}}
+  end
+
+  @impl true
+  def handle_buffer(:audio, buffer, _ctx, state) do
+    audio = Base.encode64(buffer.payload)
+    sample_rate = 16_000
+
+    frame =
+      %{
+        realtime_input: %{
+          media_chunks: [
+            %{
+              mime_type: "audio/pcm;rate=#{sample_rate}",
+              data: audio
+            }
+          ]
+        }
+      }
+      |> Jason.encode!()
+
+    :ok = GeminiWebSocket.send_frame(state.ws, frame)
+    {[], state}
+  end
+
+  @impl true
+  def handle_buffer(:video, buffer, _ctx, state) do
+    video = Base.encode64(buffer.payload)
+    frame =
+      %{
+        realtime_input: %{
+          media_chunks: [
+            %{
+              mime_type: "image/jpeg",
+              data: video
+            }
+          ]
+        }
+      }
+      |> Jason.encode!()
+    :ok = GeminiWebSocket.send_frame(state.ws, frame)
+    {[], state}
+  end
+  
+  @impl true
+  def handle_info({:websocket_frame, {:binary, frame}}, _ctx, state) do
+    case Jason.decode!(frame) do
+      %{
+        "serverContent" => %{
+          "modelTurn" => %{
+            "parts" => [
+              %{"inlineData" => %{"data" => audio_data, "mimeType" => "audio/pcm;rate=24000"}}
+            ]
+          }
+        }
+      } ->
+        audio_payload = Base.decode64!(audio_data)
+        {[buffer: {:output, %Membrane.Buffer{payload: audio_payload}}], state}
+
+      %{
+        "serverContent" => %{
+          "interrupted" => true
+        }
+      } ->
+        PlaybackQueue.clear_cache()
+        {[], state}
+
+      response ->
+        Membrane.Logger.debug("Unhandled response: #{inspect(response)}")
+        {[], state}
+    end
+  end
+end
+```
+
+## Membrane Components
+
+Then, we will create a Membrane Element that will receive and send raw audio frames via the WebSocket.
+
+```elixir
+defmodule EgressSource do
+  use Membrane.Source
+  require Membrane.Logger
+
+  def_output_pad(:output, accepted_format: _any, flow_control: :push)
+
+  def_options playback_queue_pid: []
+
+
+  @impl true
+  def handle_init(_ctx, opts) do
+    state = %{playback_queue_pid: opts.playback_queue_pid}
+    
+    {[], state}
+  end
+
+  @impl true
+  def handle_playing(_ctx, state) do
+    format = %Membrane.RawAudio{channels: 1, sample_rate: 24_000, sample_format: :s16le}
+    
+    Process.send_after(self(), :push_buffers, 20)
+    {[stream_format: {:output, format}], state}
+  end
+
+  def handle_info(:push_buffers, _ctx, state) do
+    # We send 20 millisecond chunks
+    chunk_duration_ms = 20
+    # Samples per second * bytes per sample * chunk duration in seconds
+    chunk_byte_size = trunc(24_000 * 2 * chunk_duration_ms / 1_000)
+    {:ok, response_chunk} = PlaybackQueue.get_response_chunk(chunk_byte_size)
+
+    Process.send_after(self(), :push_buffers, 20)
+
+    {[
+      buffer: {:output, %Membrane.Buffer{payload: response_chunk}}
+    ], state}
+  end
+end
+```
+
+Now, let's write a Pipeline module that exchanges the media with the browser using `Membrane.WebRTC.Source` and `Sink` and with Gemini server using `GeminiEndpoint`.
+
+Because WebRTC requires and provides audio in OPUS format and Gemini API uses raw audio, we have to spawn the proper encoder and decoder between WebRTC and Gemini elements.
+
+```elixir
+defmodule GeminiPipeline do
+  use Membrane.Pipeline
+
+  @impl true
+  def handle_init(_ctx, opts) do
+    {:ok, playback_queue} = PlaybackQueue.start_link(nil)
+
+    spec = [
+      # WebRTC Source -> Gemini -> PlaybackQueue
+      child(:webrtc_source, %Membrane.WebRTC.Source{
+        signaling: {:websocket, port: opts[:webrtc_source_ws_port]}
+      })
+      |> via_out(:output, options: [kind: :audio])
+      |> child(:input_opus_parser, Membrane.Opus.Parser)
+      |> child(:opus_decoder, %Membrane.Opus.Decoder{sample_rate: 24_000})
+      |> via_in(:audio)
+      |> child(:gemini, %GeminiEndpoint{
+        websocket_opts: opts[:gemini_ws_opts],
+        playback_queue_pid: playback_queue
+      })
+      |> child(
+        :playback_sink,
+        %Membrane.Debug.Sink{
+          handle_buffer: &PlaybackQueue.append_audio(&1.payload)
+        }
+      ),
+      
+      # PlaybackQueue -> WebRTC Sink
+      child(:playback_source, %EgressSource{playback_queue_pid: playback_queue})
+      |> child(:raw_audio_parser, %Membrane.RawAudioParser{overwrite_pts?: true})
+      |> via_in(:input, target_queue_size: 1_000_000_000, toilet_capacity: 1_000_000_000)
+      |> child(:realtimer, Membrane.Realtimer)
+      |> child(:opus_encoder, Membrane.Opus.Encoder)
+      |> via_in(:input, options: [kind: :audio])
+      |> child(:webrtc_sink, %Membrane.WebRTC.Sink{
+        tracks: [:audio],
+        signaling: {:websocket, port: opts[:webrtc_sink_ws_port]}
+      }),
+
+      # Send video to Gemini
+      get_child(:webrtc_source)
+      |> via_out(:output, options: [kind: :video])
+      |> child(:h264_parser, %Membrane.H264.Parser{})
+      |> child(:h264_decoder, Membrane.H264.FFmpeg.Decoder)
+      |> child(:jpeg_encoder, Turbojpeg.Filter)
+      |> via_in(:video)
+      |> get_child(:gemini)
+    ]
+
+    {[spec: spec], %{}}
+  end
+end
+```
+
+## Running the server
+
+Now, let's start the pipeline.
+
+```elixir
+{:ok, _supervisor, pipeline} =
+  Membrane.Pipeline.start_link(GeminiPipeline,
+    gemini_ws_opts: [],
+    webrtc_source_ws_port: 8829,
+    webrtc_sink_ws_port: 8831
+  )
+
+:inets.start()
+
+:inets.start(:httpd,
+  bind_address: ~c"localhost",
+  port: 8000,
+  document_root: ~c"#{__DIR__}/assets",
+  server_name: ~c"webrtc",
+  server_root: "/tmp"
+)
+
+Process.monitor(pipeline)
+
+KinoMembrane.pipeline_dashboard(pipeline)
+```
+
+Enter <http://localhost:8000/index.html> from the new tab of Google Chrome and start your conversation with the AI!
+
+Transcription of AI answers will be available in the logs of the cell below.
+
+```elixir
+receive do
+  {:DOWN, _ref, :process, ^pipeline, _reason} -> :ok
+end
+```
+
+<!-- livebook:{"offset":9786,"stamp":{"token":"XCP.H2zRfqLCC0Rb-wWjX88j-_5kQ2fGpXm0T4AtqfwTpW8EqzOsq7p4jd4U1cvvy-_17fOG-Pel77WaHUUuCmnta-DqYsmDjf67z-KgES_5RPfTNVPI_r3S9WFrcvfYzIempS-uJvajcZ4A7K9S","version":2}} -->
