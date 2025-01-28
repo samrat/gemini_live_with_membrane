@@ -244,10 +244,8 @@ defmodule GeminiPipeline do
 
   @impl true
   def handle_init(_ctx, opts) do
-    # {:ok, playback_queue} = PlaybackQueue.start_link(nil)
-
     spec = [
-      # WebRTC Source -> Gemini -> PlaybackQueue
+      # WebRTC Source -> Gemini -> PlaybackQueue -> WebRTC Sink
       child(:webrtc_source, %Membrane.WebRTC.Source{
         signaling: {:websocket, port: opts[:webrtc_source_ws_port]}
       })
@@ -257,11 +255,8 @@ defmodule GeminiPipeline do
       |> via_in(:audio)
       |> child(:gemini, %GeminiEndpoint{
         websocket_opts: opts[:gemini_ws_opts],
-        # playback_queue_pid: playback_queue
       })
-      |> child(
-        :playback_queue, PlaybackQueue
-      )
+      |> child(:playback_queue, PlaybackQueue)
       |> child(:raw_audio_parser, %Membrane.RawAudioParser{overwrite_pts?: true})
       |> via_in(:input, target_queue_size: 1_000_000_000, toilet_capacity: 1_000_000_000)
       |> child(:realtimer, Membrane.Realtimer)
@@ -324,4 +319,4 @@ receive do
 end
 ```
 
-<!-- livebook:{"offset":9068,"stamp":{"token":"XCP.2AoasipLhKhWm3XjNBSsEy3YFzd7JIID_sU9nIk9EthKtk7dtCQhsIZkT2Ucu9z-U07MN0LlXLpDtwIhnrhnHrzv_S4I843sac6fAqpsWt1vMk-FwnyAeRTMu0jX8I1Or9hRbxmyPKxEAJw4","version":2}} -->
+<!-- livebook:{"offset":8961,"stamp":{"token":"XCP.eP5cJpI25khXFi3e95fc3turKjkJwgJuDPY_XAC_xuypmf8mNx-J_To1EE8O-q-i16Na6jVEKAzT4tgruZ2FYEZq-lrsJDel9Zc_NOvLe1p6e4bfKzk4WUhHqPzSb2sX3Hj7vhuK2peu2RO4","version":2}} -->
