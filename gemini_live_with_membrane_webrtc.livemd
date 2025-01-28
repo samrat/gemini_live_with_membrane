@@ -17,7 +17,8 @@ Mix.install([
   {:membrane_h26x_plugin, "~> 0.10.2"},
   {:membrane_h264_ffmpeg_plugin, "~> 0.32.5"},
   {:turbojpeg, github: "gBillal/elixir-turbojpeg", branch: "upgrade-deps"}
-])
+],
+  consolidate_protocols: false)
 ```
 
 ## Introduction
@@ -26,58 +27,76 @@ This demo shows how to use Membrane Framework to create a simple WebRTC based ap
 
 ## Playback Queue
 
-Instead of sending Gemini's audio responses directly to the WebRTC sink, we queue it up using a simple GenServer. This module enables us to clear the queue when the user interrupts Gemini, and we no longer want to play the rest of Gemini's current response.
+Instead of sending Gemini's audio responses directly to the WebRTC sink, we queue it up using a Membrane filter called `PlaybackQueue`. This filter enables us to clear the queue when the user interrupts Gemini, and we no longer want to play the rest of Gemini's current response.
+
+```elixir
+defmodule PlaybackQueue.Events.Reset do
+  @moduledoc """
+  Event that resets `PlaybackQueue`
+  After receiving this event, `Membrane.Realtimer` will behave as if it would be freshly spawned.
+  """
+
+  @derive Membrane.EventProtocol
+  defstruct []
+end
+```
 
 ```elixir
 defmodule PlaybackQueue do
-  use GenServer
+  use Membrane.Filter
+  require Membrane.Logger
 
-  def start_link(_opts) do
-    GenServer.start_link(__MODULE__, %{response: <<>>}, name: __MODULE__)
-  end
+  def_input_pad(:input, accepted_format: _any)
 
-  def append_audio(chunk) do
-    GenServer.call(__MODULE__, {:append_audio, chunk})
-  end
-
-  def clear_cache() do
-    GenServer.call(__MODULE__, :clear_cache)
-  end
-
-  def get_response_chunk(size) do
-    GenServer.call(__MODULE__, {:get_response_chunk, size})
-  end 
+  def_output_pad(:output, accepted_format: _any, flow_control: :push)
 
   @impl true
-  def init(state) do
-    {:ok, state}
+  def handle_init(_ctx, _opts) do
+    {[], %{audio_buffer: <<>>}}
   end
 
   @impl true
-  def handle_call(:clear_cache, _from, state) do
-    new_state = %{state | response: <<>>}
-    {:reply, :ok, new_state}
+  def handle_playing(_ctx, state) do
+    format = %Membrane.RawAudio{channels: 1, sample_rate: 24_000, sample_format: :s16le}
+    
+    Process.send_after(self(), :push_buffers, 20)
+    {[stream_format: {:output, format}], state}
   end
 
   @impl true
-  def handle_call({:append_audio, chunk}, _from, state) do
-    new_state = %{state | response: state.response <> chunk}
-    {:reply, :ok, new_state}
+  def handle_buffer(:input, buffer, _ctx, state) do
+    {[], %{state | audio_buffer: state.audio_buffer <> buffer.payload}}
   end
 
-  @impl true
-  def handle_call({:get_response_chunk, size}, _from, state) do
-    case state.response do
+  def handle_info(:push_buffers, _ctx, state) do
+    # We send 20 millisecond chunks
+    chunk_duration_ms = 20
+    # Samples per second * bytes per sample * chunk duration in seconds
+    chunk_byte_size = trunc(24_000 * 2 * chunk_duration_ms / 1_000)
+
+    {chunk, new_audio_buffer} = get_chunk(state.audio_buffer, chunk_byte_size)
+    Process.send_after(self(), :push_buffers, 20)
+
+    {[
+      buffer: {:output, %Membrane.Buffer{payload: chunk}}
+    ], %{state | audio_buffer: new_audio_buffer}}
+  end
+
+  def handle_event(:input, %PlaybackQueue.Events.Reset{}, _ctx, state) do
+    {[], %{state | audio_buffer: <<>>}}
+  end
+
+  def get_chunk(audio_buffer, size) do
+    case audio_buffer do
       <<chunk::binary-size(size), rest::binary>> ->
         # If we have enough data, send it back
-        {:reply, {:ok, chunk}, %{state | response: rest}}
-
+        {chunk, rest}
       chunk ->
         # Otherwise, send what we have, padded with silence
         silence = <<0::size(size - byte_size(chunk))-unit(8)>>
-        {:reply, {:ok, chunk <> silence}, %{state | response: <<>>}}
+        {chunk <> silence, <<>>}
     end
-  end 
+  end
 end
 ```
 
@@ -134,12 +153,12 @@ defmodule GeminiEndpoint do
 
   def_output_pad(:output, accepted_format: _any)
 
-  def_options(websocket_opts: [], playback_queue_pid: [])
+  def_options(websocket_opts: [])
 
   @impl true
   def handle_init(_ctx, opts) do
     {:ok, ws} = GeminiWebSocket.start_link(opts.websocket_opts)
-    {[], %{ws: ws, playback_queue_pid: opts.playback_queue_pid}}
+    {[], %{ws: ws}}
   end
 
   @impl true
@@ -203,8 +222,7 @@ defmodule GeminiEndpoint do
           "interrupted" => true
         }
       } ->
-        PlaybackQueue.clear_cache()
-        {[], state}
+        {[event: {:output, %PlaybackQueue.Events.Reset{}}], state}
 
       response ->
         Membrane.Logger.debug("Unhandled response: #{inspect(response)}")
@@ -216,49 +234,6 @@ end
 
 ## Membrane Components
 
-Then, we will create a Membrane Element that will receive and send raw audio frames via the WebSocket.
-
-```elixir
-defmodule EgressSource do
-  use Membrane.Source
-  require Membrane.Logger
-
-  def_output_pad(:output, accepted_format: _any, flow_control: :push)
-
-  def_options playback_queue_pid: []
-
-
-  @impl true
-  def handle_init(_ctx, opts) do
-    state = %{playback_queue_pid: opts.playback_queue_pid}
-    
-    {[], state}
-  end
-
-  @impl true
-  def handle_playing(_ctx, state) do
-    format = %Membrane.RawAudio{channels: 1, sample_rate: 24_000, sample_format: :s16le}
-    
-    Process.send_after(self(), :push_buffers, 20)
-    {[stream_format: {:output, format}], state}
-  end
-
-  def handle_info(:push_buffers, _ctx, state) do
-    # We send 20 millisecond chunks
-    chunk_duration_ms = 20
-    # Samples per second * bytes per sample * chunk duration in seconds
-    chunk_byte_size = trunc(24_000 * 2 * chunk_duration_ms / 1_000)
-    {:ok, response_chunk} = PlaybackQueue.get_response_chunk(chunk_byte_size)
-
-    Process.send_after(self(), :push_buffers, 20)
-
-    {[
-      buffer: {:output, %Membrane.Buffer{payload: response_chunk}}
-    ], state}
-  end
-end
-```
-
 Now, let's write a Pipeline module that exchanges the media with the browser using `Membrane.WebRTC.Source` and `Sink` and with Gemini server using `GeminiEndpoint`.
 
 Because WebRTC requires and provides audio in OPUS format and Gemini API uses raw audio, we have to spawn the proper encoder and decoder between WebRTC and Gemini elements.
@@ -269,7 +244,7 @@ defmodule GeminiPipeline do
 
   @impl true
   def handle_init(_ctx, opts) do
-    {:ok, playback_queue} = PlaybackQueue.start_link(nil)
+    # {:ok, playback_queue} = PlaybackQueue.start_link(nil)
 
     spec = [
       # WebRTC Source -> Gemini -> PlaybackQueue
@@ -282,17 +257,11 @@ defmodule GeminiPipeline do
       |> via_in(:audio)
       |> child(:gemini, %GeminiEndpoint{
         websocket_opts: opts[:gemini_ws_opts],
-        playback_queue_pid: playback_queue
+        # playback_queue_pid: playback_queue
       })
       |> child(
-        :playback_sink,
-        %Membrane.Debug.Sink{
-          handle_buffer: &PlaybackQueue.append_audio(&1.payload)
-        }
-      ),
-      
-      # PlaybackQueue -> WebRTC Sink
-      child(:playback_source, %EgressSource{playback_queue_pid: playback_queue})
+        :playback_queue, PlaybackQueue
+      )
       |> child(:raw_audio_parser, %Membrane.RawAudioParser{overwrite_pts?: true})
       |> via_in(:input, target_queue_size: 1_000_000_000, toilet_capacity: 1_000_000_000)
       |> child(:realtimer, Membrane.Realtimer)
@@ -334,7 +303,7 @@ Now, let's start the pipeline.
 
 :inets.start(:httpd,
   bind_address: ~c"localhost",
-  port: 8098,
+  port: 8000,
   document_root: ~c"#{__DIR__}/assets",
   server_name: ~c"webrtc",
   server_root: "/tmp"
@@ -355,4 +324,4 @@ receive do
 end
 ```
 
-<!-- livebook:{"offset":9786,"stamp":{"token":"XCP.v0jy0NiO1Xa3WmM6Zuj_ozwC2WJ0Pd2v8U3bhZe8a-KbY5B61xEWSrsf_uxv7e-2pL-EsIMq7LDKhwBXXMe2j6goAXJVlqjQJ69r93eWffrc54sHXCGLTlkkFi_9ttGUd75d8xWsaENlmjXb","version":2}} -->
+<!-- livebook:{"offset":9068,"stamp":{"token":"XCP.2AoasipLhKhWm3XjNBSsEy3YFzd7JIID_sU9nIk9EthKtk7dtCQhsIZkT2Ucu9z-U07MN0LlXLpDtwIhnrhnHrzv_S4I843sac6fAqpsWt1vMk-FwnyAeRTMu0jX8I1Or9hRbxmyPKxEAJw4","version":2}} -->
