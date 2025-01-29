@@ -77,7 +77,10 @@ defmodule PlaybackQueue do
     {chunk, new_audio_buffer} = get_chunk(state.audio_buffer, chunk_byte_size)
     Process.send_after(self(), :push_buffers, 20)
 
+    format = %Membrane.RawAudio{channels: 1, sample_rate: 24_000, sample_format: :s16le}
+
     {[
+      stream_format: {:output, format},
       buffer: {:output, %Membrane.Buffer{payload: chunk}}
     ], %{state | audio_buffer: new_audio_buffer}}
   end
@@ -148,10 +151,19 @@ defmodule GeminiEndpoint do
   use Membrane.Filter
   require Membrane.Logger
 
-  def_input_pad(:audio, accepted_format: _any)
+  alias Membrane.RawAudio
+
+  @output_format %RawAudio{sample_rate: 24_000, channels: 1, sample_format: :s16le}
+
+  def_input_pad(:audio,
+    accepted_format: %RawAudio{sample_rate: 16_000, channels: 1, sample_format: :s16le}
+  )
+
   def_input_pad(:video, accepted_format: _any)
 
-  def_output_pad(:output, accepted_format: _any)
+  def_output_pad(:output,
+    accepted_format: @output_format
+  )
 
   def_options(websocket_opts: [])
 
@@ -159,6 +171,11 @@ defmodule GeminiEndpoint do
   def handle_init(_ctx, opts) do
     {:ok, ws} = GeminiWebSocket.start_link(opts.websocket_opts)
     {[], %{ws: ws}}
+  end
+
+  @impl true
+    def handle_stream_format(:audio, _stream_format, _ctx, state) do
+    {[stream_format: {:output, @output_format}], state}
   end
 
   @impl true
@@ -186,6 +203,7 @@ defmodule GeminiEndpoint do
   @impl true
   def handle_buffer(:video, buffer, _ctx, state) do
     video = Base.encode64(buffer.payload)
+
     frame =
       %{
         realtime_input: %{
@@ -198,10 +216,11 @@ defmodule GeminiEndpoint do
         }
       }
       |> Jason.encode!()
+
     :ok = GeminiWebSocket.send_frame(state.ws, frame)
     {[], state}
   end
-  
+
   @impl true
   def handle_info({:websocket_frame, {:binary, frame}}, _ctx, state) do
     case Jason.decode!(frame) do
@@ -251,13 +270,19 @@ defmodule GeminiPipeline do
       })
       |> via_out(:output, options: [kind: :audio])
       |> child(:input_opus_parser, Membrane.Opus.Parser)
-      |> child(:opus_decoder, %Membrane.Opus.Decoder{sample_rate: 24_000})
+      |> child(:opus_decoder, %Membrane.Opus.Decoder{sample_rate: 16_000})
       |> via_in(:audio)
       |> child(:gemini, %GeminiEndpoint{
         websocket_opts: opts[:gemini_ws_opts],
       })
       |> child(:playback_queue, PlaybackQueue)
-      |> child(:raw_audio_parser, %Membrane.RawAudioParser{overwrite_pts?: true})
+      |> child(:raw_audio_parser, %Membrane.RawAudioParser{
+        stream_format: %Membrane.RawAudio{
+          channels: 1,
+          sample_format: :s16le,
+          sample_rate: 24_000
+        },
+        overwrite_pts?: true})
       |> via_in(:input, target_queue_size: 1_000_000_000, toilet_capacity: 1_000_000_000)
       |> child(:realtimer, Membrane.Realtimer)
       |> child(:opus_encoder, Membrane.Opus.Encoder)
@@ -319,4 +344,4 @@ receive do
 end
 ```
 
-<!-- livebook:{"offset":8961,"stamp":{"token":"XCP.eP5cJpI25khXFi3e95fc3turKjkJwgJuDPY_XAC_xuypmf8mNx-J_To1EE8O-q-i16Na6jVEKAzT4tgruZ2FYEZq-lrsJDel9Zc_NOvLe1p6e4bfKzk4WUhHqPzSb2sX3Hj7vhuK2peu2RO4","version":2}} -->
+<!-- livebook:{"offset":9584,"stamp":{"token":"XCP.Rvlfgu7kMqtKxTOAEhYaHfhboG0Y4O_TlGIbCrtApsJmE4U_AXZhxY5TLsj9Jj3NfCc-8V9lHO1G0MPnxrKC6gGrJn6evjENBmvPsiT3ZWJTawZ5hKXOOmxnt_81yA4MqJlGuIZI3DeeiYhy","version":2}} -->
