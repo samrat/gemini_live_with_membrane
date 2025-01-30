@@ -276,13 +276,7 @@ defmodule GeminiPipeline do
         websocket_opts: opts[:gemini_ws_opts],
       })
       |> child(:playback_queue, PlaybackQueue)
-      |> child(:raw_audio_parser, %Membrane.RawAudioParser{
-        stream_format: %Membrane.RawAudio{
-          channels: 1,
-          sample_format: :s16le,
-          sample_rate: 24_000
-        },
-        overwrite_pts?: true})
+      |> child(:raw_audio_parser, %Membrane.RawAudioParser{overwrite_pts?: true})
       |> via_in(:input, target_queue_size: 1_000_000_000, toilet_capacity: 1_000_000_000)
       |> child(:realtimer, Membrane.Realtimer)
       |> child(:opus_encoder, Membrane.Opus.Encoder)
@@ -344,4 +338,4 @@ receive do
 end
 ```
 
-<!-- livebook:{"offset":9584,"stamp":{"token":"XCP.Rvlfgu7kMqtKxTOAEhYaHfhboG0Y4O_TlGIbCrtApsJmE4U_AXZhxY5TLsj9Jj3NfCc-8V9lHO1G0MPnxrKC6gGrJn6evjENBmvPsiT3ZWJTawZ5hKXOOmxnt_81yA4MqJlGuIZI3DeeiYhy","version":2}} -->
+<!-- livebook:{"offset":9435,"stamp":{"token":"XCP.1cHY1u3S8MHxA4uu_W-qZm3l5VpnhQTq9l-lrt26o-KSepDbbzCOsOvi-n2fqBxHwsgyDbNTOvMZdAEBXVhLMFgRSqs-RMHzrdHnpfcJ54hYiYhJOFSR25RpZJos5JqgRlSv9jeRtr3-gsk4","version":2}} -->
